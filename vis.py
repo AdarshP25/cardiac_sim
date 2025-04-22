@@ -5,7 +5,7 @@ import matplotlib.animation as animation
 # Parameters
 nx = 1002
 ny = 1002
-nt = 1000001
+nt = 1000000
 snapshot_interval = 1000
 num_snapshots = nt // snapshot_interval
 
@@ -13,7 +13,7 @@ num_snapshots = nt // snapshot_interval
 frames = np.zeros((num_snapshots, nx, ny))
 for i in range(num_snapshots):
     t = (i + 1) * snapshot_interval
-    with open(f"data/snapshot_{t}.bin", "rb") as f:
+    with open(f"data2/snapshot_{t}.bin", "rb") as f:
         frames[i] = np.fromfile(f, dtype=np.float32).reshape(nx, ny)
 
 # Create animation

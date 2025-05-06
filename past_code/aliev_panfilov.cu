@@ -26,7 +26,7 @@ __global__ void laplacianKernel(float* u, float* lap_u, int nx, int ny) {
     int ix = blockIdx.x * blockDim.x + threadIdx.x;
     int iy = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Shared memory for 32x8 tile + 1-cell halo
+    // Shared memory
     __shared__ float u_shared[10][34]; // 10 rows (y: 8 + 1 + 1), 34 columns (x: 32 + 1 + 1)
 
     int idx = iy * nx + ix;
@@ -62,7 +62,7 @@ __global__ void laplacianKernel(float* u, float* lap_u, int nx, int ny) {
     if (ix < nx && iy < ny) {
         float lap = 0.0f;
 
-        // Interior points: standard 5-point stencil
+        // Interior points
         if (ix > 0 && ix < nx - 1 && iy > 0 && iy < ny - 1) {
             lap = u_shared[threadIdx.y + 1][threadIdx.x] +     // Left
                   u_shared[threadIdx.y + 1][threadIdx.x + 2] + // vight
@@ -127,7 +127,7 @@ __global__ void laplacianKernel(float* u, float* lap_u, int nx, int ny) {
     }
 }
 
-// CUDA kernel for FitzHugh-Nagumo update
+// CUDA kernel for Aliev-Panfilov update
 __global__ void updateKernel(float* u, float* v, float* u_new, float* v_new, float* lap_u, float D, float dt, float eps_0, float a, float k, float mu1, float mu2, int nx, int ny, int t) {
     int ix = blockIdx.x * blockDim.x + threadIdx.x;
     int iy = blockIdx.y * blockDim.y + threadIdx.y;
@@ -136,7 +136,6 @@ __global__ void updateKernel(float* u, float* v, float* u_new, float* v_new, flo
     
     int idx = iy * nx + ix;
     
-    // Update u
     float u_val = u[idx];
     float v_val = v[idx];
     float eps = eps_0 + ((mu1 * v_val) / (mu2 + u_val));
@@ -160,8 +159,6 @@ int main() {
         cudaMalloc(&d_temp, size);
         
         // Potential initial conditions
-
-        // Initialize u with scattered 50x50 squares, v to 0
         std::memset(h_u, 0, size);
         std::memset(h_v, 0, size);
 
@@ -190,15 +187,14 @@ int main() {
             }
         }
         
-        // Copy initial conditions to device
         cudaMemcpy(d_u, h_u, size, cudaMemcpyHostToDevice);
         cudaMemcpy(d_v, h_v, size, cudaMemcpyHostToDevice);
         
-        // Set up CUDA grid and block dimensions
+        // CUDA config
         dim3 blockDim(32, 8);
         dim3 gridDim((nx + blockDim.x - 1) / blockDim.x, (ny + blockDim.y - 1) / blockDim.y);
         
-        // Allocate host memory for snapshots
+        // snapshots
         float* h_frames = new float[num_snapshots * nx * ny];
         int snap_index = 0;
         

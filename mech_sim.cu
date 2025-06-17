@@ -3,25 +3,6 @@
 #include <cmath> // For hypotf
 #include <cuda_runtime.h>
 
-// Forward Declarations
-__global__ void clear_forces(float2* force, int N);
-__global__ void compute_cell_forces(
-    const float2* pos,          // Input: Current vertex positions
-    float2* force,              // Output: Accumulated forces (atomic adds)
-    const int* cell_vidx,       // Input: Cell connectivity (vertex indices)
-    float ks_edge,              // Input: Stiffness of edge springs
-    float rest_length_edge,     // Input: Rest length for edge springs
-    int C,                      // Input: Number of cells
-    const float* u);             // Input: Auxiliary field (unused here)
-__global__ void position_verlet(
-    float2* pos, float2* prev_pos, const float2* force,
-    float dt, int N);
-__global__ void calculate_velocity_pv(
-    float2* vel, const float2* pos_c, const float2* pos_p,
-    float dt, int N);
-
-
-
 // CUDA error checking helper
 static void check(cudaError_t e) {
     if (e != cudaSuccess) {
@@ -29,219 +10,10 @@ static void check(cudaError_t e) {
     }
 }
 
-// Kernels
-
-__global__ void clear_forces(float2* force, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) {
-        force[i] = make_float2(0.0f, 0.0f);
-    }
-}
-
-__device__ inline void calculate_and_apply_spring_force(
-    int va, int vb,
-    float2 pa, float2 pb,
-    float2* force,
-    float ks,
-    float rest_length)
-{
-    // Calculate the vector from A to B
-    float2 vec_ab = make_float2(pb.x - pa.x, pb.y - pa.y);
-
-    // Calculate the current length of the spring
-    float current_length = hypotf(vec_ab.x, vec_ab.y);
-
-    // Avoid division by zero
-    if (current_length < 1e-6f) {
-        return;
-    }
-
-    float displacement = current_length - rest_length;
-
-    // Calculate the magnitude of the restoring force (Hooke's Law: F = -k * displacement)
-    float force_magnitude = -ks * displacement;
-
-    // normalized direction
-    float2 direction = make_float2(vec_ab.x / current_length, vec_ab.y / current_length);
-
-    // Calculate the force vector
-    float2 force_vector = make_float2(force_magnitude * direction.x, force_magnitude * direction.y);
-
-    // Apply the forces to the vertices using atomic operations
-    atomicAdd(&force[vb].x, force_vector.x);
-    atomicAdd(&force[vb].y, force_vector.y);
-    atomicAdd(&force[va].x, -force_vector.x);
-    atomicAdd(&force[va].y, -force_vector.y);
-}
-
-__global__ void compute_cell_forces(
-    const float2* pos,
-    float2* force,
-    const int* cell_vidx,
-    float ks_edge,
-    float rest_length_edge,
-    int C)
-{
-    
-    int ci = blockIdx.x * blockDim.x + threadIdx.x;
-
-    
-    if (ci >= C) return;
-
-    
-    int base_idx = ci * 4;
-    int v_indices[4];
-    v_indices[0] = cell_vidx[base_idx + 0]; // top-left (v0)
-    v_indices[1] = cell_vidx[base_idx + 1]; // top-right (v1)
-    v_indices[2] = cell_vidx[base_idx + 2]; // bot-right (v2)
-    v_indices[3] = cell_vidx[base_idx + 3]; // bot-left (v3)
-
-    // Check for invalid indices
-    if (v_indices[0] < 0 || v_indices[1] < 0 || v_indices[2] < 0 || v_indices[3] < 0) return;
-
-    // Get Vertex Positions
-    float2 p[4];
-    p[0] = pos[v_indices[0]];
-    p[1] = pos[v_indices[1]];
-    p[2] = pos[v_indices[2]];
-    p[3] = pos[v_indices[3]];
-
-    // --- Calculate forces for the perimeter connections ---
-
-    // Connection 0-1 (Top Edge)
-    calculate_and_apply_spring_force(v_indices[0], v_indices[1], p[0], p[1], force, ks_edge, rest_length_edge);
-
-    // Connection 1-2 (Right Edge)
-    calculate_and_apply_spring_force(v_indices[1], v_indices[2], p[1], p[2], force, ks_edge, rest_length_edge);
-
-    // Connection 2-3 (Bot Edge)
-    calculate_and_apply_spring_force(v_indices[2], v_indices[3], p[2], p[3], force, ks_edge, rest_length_edge);
-
-    // Connection 3-0 (Left Edge)
-    calculate_and_apply_spring_force(v_indices[3], v_indices[0], p[3], p[0], force, ks_edge, rest_length_edge);
-}
-
-__global__ void compute_active_stress_force(
-    const float2* pos,          // Input: Current vertex positions
-    float2* force,              // Output: Accumulated forces (atomic adds)
-    const int* cell_vidx,       // Input: Cell connectivity (vertex indices)
-    const float* u,             // Input: Activation field
-    float T0,                   // Input: Max tension
-    float beta,                 // Input: Activation steepness
-    float ua,                   // Input: Activation threshold
-    float active_force_scaling, // Input: Scaling factor from tension to force
-    int C)                      // Input: Number of cells
-{
-    int ci = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ci >= C) return;
-
-    int base_idx = ci * 4;
-    int v_indices[4];
-    float u_vals[4];
-    float2 p[4];
-
-    // Gather vertex indices, positions, and u values for the cell
-    float u_sum = 0.0f;
-    for (int k = 0; k < 4; ++k) {
-        v_indices[k] = cell_vidx[base_idx + k];
-        if (v_indices[k] < 0) return; // Invalid index check
-        p[k] = pos[v_indices[k]];
-        u_vals[k] = u[v_indices[k]];
-        u_sum += u_vals[k];
-    }
-
-    // Calculate average u for the cell
-    float u_avg = u_sum * 0.25f;
-
-    // Calculate active tension using tanh based on average u
-    // tanhf is the float version
-    float Ta = T0 * tanhf(beta * (u_avg - ua));
-
-    // Optional: Add a small threshold to avoid tiny forces if needed
-    // if (fabsf(Ta) < 1e-4f) return;
-
-    // Calculate cell centroid
-    float2 centroid = make_float2(
-        (p[0].x + p[1].x + p[2].x + p[3].x) * 0.25f,
-        (p[0].y + p[1].y + p[2].y + p[3].y) * 0.25f
-    );
-
-    // Apply force to each vertex based on Ta and centroid
-    for (int k = 0; k < 4; ++k) {
-        int vk = v_indices[k];
-        float2 pk = p[k];
-
-        // Vector from centroid to vertex
-        float2 vec_centroid_to_p = make_float2(pk.x - centroid.x, pk.y - centroid.y);
-        float len = hypotf(vec_centroid_to_p.x, vec_centroid_to_p.y);
-
-        if (len > 1e-6f) { // Avoid division by zero
-            // Normalized direction from centroid to vertex
-            float2 dir = make_float2(vec_centroid_to_p.x / len, vec_centroid_to_p.y / len);
-
-            // Force magnitude: Proportional to Ta.
-            // Negative sign means contraction (Ta > 0) pulls towards centroid (opposite to dir).
-            float force_magnitude = -active_force_scaling * Ta;
-
-            // Force vector
-            float2 force_k = make_float2(force_magnitude * dir.x, force_magnitude * dir.y);
-
-            // Atomically add force to the vertex
-            atomicAdd(&force[vk].x, force_k.x);
-            atomicAdd(&force[vk].y, force_k.y);
-        }
-    }
-}
-
-
-__global__ void position_verlet(
-    float2* pos,
-    float2* prev_pos,
-    const float2* force,
-    float dt,
-    int N)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) {
-        float2 current_pos = pos[i];
-
-        float2 accel = force[i];
-
-        float2 next_pos;
-        float dt_sq = dt * dt;
-
-        next_pos.x = 2.0f * current_pos.x - prev_pos[i].x + accel.x * dt_sq;
-        next_pos.y = 2.0f * current_pos.y - prev_pos[i].y + accel.y * dt_sq;
-
-        prev_pos[i] = current_pos;
-
-        pos[i] = next_pos;
-    }
-}
-
-__global__ void calculate_velocity_pv(
-    float2* vel,
-    const float2* pos_c,
-    const float2* pos_p,
-    float dt,
-    int N)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) {
-        if (dt > 0.0f) {
-             vel[i].x = (pos_c[i].x - pos_p[i].x) / dt;
-             vel[i].y = (pos_c[i].y - pos_p[i].y) / dt;
-        } else {
-             vel[i] = make_float2(0.0f, 0.0f);
-        }
-    }
-}
-
-// Class Methods
-
-MechSim::MechSim(int nx_, int ny_, float dx, float dy)
-    : nx(nx_), ny(ny_) {
+MechSim::MechSim(int nx_, int ny_, float* fiber_angles_, float damping_)
+    : nx(nx_), ny(ny_), damping(damping_) {
     N = nx * ny;
+    fiber_angles = fiber_angles_;
     C = (nx - 1) * (ny - 1);
     if (N <= 0 || C < 0) {
         throw std::runtime_error("Invalid grid dimensions");
@@ -268,9 +40,10 @@ MechSim::MechSim(int nx_, int ny_, float dx, float dy)
     for (int j = 0; j < ny; ++j) {
         for (int i = 0; i < nx; ++i) {
             int idx = j * nx + i;
-            h_pos[idx] = make_float2(static_cast<float>(i) * dx, static_cast<float>(j) * dy);
+            h_pos[idx] = make_float2(static_cast<float>(i) * rest_length_edge, static_cast<float>(j) * rest_length_edge);
         }
     }
+    h_pos[0] = make_float2(0.5f, 0.5f);
     // Copy initial positions to both current and previous device arrays
     check(cudaMemcpy(d_pos_c, h_pos.data(), szN, cudaMemcpyHostToDevice));
     check(cudaMemcpy(d_pos_p, h_pos.data(), szN, cudaMemcpyHostToDevice)); // Initialize prev pos too
@@ -300,6 +73,25 @@ MechSim::MechSim(int nx_, int ny_, float dx, float dy)
         }
         check(cudaMemcpy(d_cell_vidx, h_idx.data(), szC4i, cudaMemcpyHostToDevice));
     }
+
+    std::vector<int> boundaryIdx;
+    std::vector<float2> boundaryPositions;
+
+    for (int j = 0; j < ny; ++j) {
+        for (int i = 0; i < nx; ++i) {
+            if (i == 0 || i == nx - 1 || j == 0 || j == ny - 1) {
+                int idx = j * nx + i;
+                boundaryIdx.push_back(idx);
+                boundaryPositions.push_back(make_float2(static_cast<float>(i) * rest_length_edge, static_cast<float>(j) * rest_length_edge));
+            }
+        }
+    }
+
+    numBoundary = boundaryIdx.size();
+    cudaMalloc(&d_boundaryIdx, numBoundary * sizeof(int));
+    cudaMalloc(&d_boundaryPositions, numBoundary * 2 * sizeof(float2));
+    cudaMemcpy(d_boundaryIdx, boundaryIdx.data(), numBoundary * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_boundaryPositions, boundaryPositions.data(), numBoundary * 2 * sizeof(float), cudaMemcpyHostToDevice);
 }
 
 MechSim::~MechSim() {
@@ -311,52 +103,144 @@ MechSim::~MechSim() {
 }
 
 
-void MechSim::step(float dt, float ks_edge, float ks_radial, float* u,
-                   float T0, float beta, float ua, float active_force_scaling) {
-    if (N <= 0) return;
+__global__ void position_verlet(
+    float2* pos,
+    float2* prev_pos,
+    const float2* force,
+    float dt,
+    int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float2 current_pos = pos[i];
 
-    int block = 256;
-    int gridV = (N + block - 1) / block;
-    int gridC = (C > 0) ? (C + block - 1) / block : 0;
+        float2 accel = force[i];
 
-    clear_forces<<<gridV, block>>>(d_force, N);
-    check(cudaGetLastError());
+        float2 next_pos;
+        float dt_sq = dt * dt;
 
+        next_pos.x = 2.0f * current_pos.x - prev_pos[i].x + accel.x * dt_sq;
+        next_pos.y = 2.0f * current_pos.y - prev_pos[i].y + accel.y * dt_sq;
 
-    if (gridC > 0) {
-        compute_cell_forces<<<gridC, block>>>(
-            d_pos_c, d_force,
-            d_cell_vidx,
-            ks_edge, MechSim::rest_length_edge,
-            C
-        );
-        check(cudaGetLastError());
+        prev_pos[i] = current_pos;
+
+        pos[i] = next_pos;
     }
-
-    compute_active_stress_force<<<gridC, block>>>(
-            d_pos_c, d_force, d_cell_vidx, u,
-            T0, beta, ua, active_force_scaling, C
-        );
-    check(cudaGetLastError());
-
-    position_verlet<<<gridV, block>>>(d_pos_c, d_pos_p, d_force, dt, N);
-    check(cudaGetLastError());
-
-    // --- Apply Constraints (e.g., boundary conditions) ---
-
-    calculate_velocity_pv<<<gridV, block>>>(d_vel, d_pos_c, d_pos_p, dt, N);
-    check(cudaGetLastError());
-
-    check(cudaDeviceSynchronize());
 }
 
-// Download CURRENT positions to host
-void MechSim::download_positions(std::vector<float2>& h_pos) {
-    if (N <= 0) {
-        h_pos.clear();
-        return;
+__global__ void calculate_velocity_pv(
+        float2* vel,
+        const float2* pos_np1,   // x_{n+1}
+        const float2* pos_nm1,   // x_{n-1}
+        float dt, int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float inv2dt = 0.5f / dt;
+        vel[i].x = (pos_np1[i].x - pos_nm1[i].x) * inv2dt;
+        vel[i].y = (pos_np1[i].y - pos_nm1[i].y) * inv2dt;
     }
-    h_pos.resize(N);
-    // Download from d_pos_c, which holds the most recent positions
-    check(cudaMemcpy(h_pos.data(), d_pos_c, N*sizeof(float2), cudaMemcpyDeviceToHost));
+}
+
+__global__ void clear_forces(float2* force, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        force[i] = make_float2(0.0f, 0.0f);
+    }
+}
+
+__global__ void calculate_structural_forces(
+        const float2* __restrict__ pos, const float2* __restrict__ vel,
+        float2* __restrict__ force,
+        int nx, int ny, float ks, float rest, float damping)
+{
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (ix >= nx || iy >= ny) return;
+
+    int idx = iy * nx + ix;
+    float2 pa = pos[idx];
+    float2 f  = make_float2(0.f, 0.f);
+
+    const int nbh[4][2] = { {-1,0},{+1,0},{0,-1},{0,+1} };
+
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        int jx = ix + nbh[k][0];
+        int jy = iy + nbh[k][1];
+        if (jx < 0 || jx >= nx || jy < 0 || jy >= ny) continue;
+
+        float2 pb  = pos[jy * nx + jx];
+        float2 d   = make_float2(pb.x - pa.x, pb.y - pa.y);
+        float  len = hypotf(d.x, d.y);
+        float  mag = ks * (len - rest);
+        f.x += mag * d.x / len;
+        f.y += mag * d.y / len;
+    }
+    force[idx].x += f.x;
+    force[idx].y += f.y;
+
+    // Damping force
+    float2 damping_force = make_float2(-damping * vel[idx].x, -damping * vel[idx].y);
+    force[idx].x += damping_force.x;
+    force[idx].y += damping_force.y;
+}
+
+__global__ void calculate_boundry_forces(const float2* __restrict__ pos,
+                                         float2* __restrict__ force,
+                                         const int* __restrict__ boundaryIdx,
+                                         const float2* __restrict__ boundaryPositions, float ks_boundary,
+                                         int numBoundary)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < numBoundary) {
+        int idx = boundaryIdx[i];
+        float2 p = pos[idx];
+        float2 f = make_float2(0.0f, 0.0f);
+
+        // Calculate force based on boundary position
+        f.x = ks_boundary * (boundaryPositions[i].x - p.x);
+        f.y = ks_boundary * (boundaryPositions[i].y - p.y);
+
+        force[idx].x += f.x;
+        force[idx].y += f.y;
+    }
+}
+
+__global__ void calculate_orthogonal_forces()
+{
+    //Passive spring
+
+    //Active Spring
+}
+
+void MechSim::step(float dt, float ks_edge, float ks_radial, float ks_boundary, float* T_a) 
+{
+    if (dt <= 0.0f) {
+        throw std::runtime_error("Time step must be positive");
+    }
+
+    // Clear forces
+    int blockSize = 256;
+    int numBlocks = (N + blockSize - 1) / blockSize;
+    clear_forces<<<numBlocks, blockSize>>>(d_force, N);
+    check(cudaGetLastError());
+
+    // Calculate structural forces
+    dim3 gridDim((nx + 15) / 16, (ny + 15) / 16);
+    dim3 blockDim(16, 16);
+    calculate_structural_forces<<<gridDim, blockDim>>>(d_pos_c, d_vel, d_force, nx, ny, ks_edge, MechSim::rest_length_edge, damping);
+    check(cudaGetLastError());
+
+    // Calculate boundary forces
+    calculate_boundry_forces<<<(numBoundary + blockSize - 1) / blockSize, blockSize>>>(d_pos_c, d_force, d_boundaryIdx, d_boundaryPositions, ks_boundary, numBoundary);
+
+
+    // Position Verlet integration
+    position_verlet<<<(N + blockSize - 1) / blockSize, blockSize>>>(d_pos_c, d_pos_p, d_force, dt, N);
+    check(cudaGetLastError());
+
+    // Calculate velocities
+    calculate_velocity_pv<<<(N + blockSize - 1) / blockSize, blockSize>>>(d_vel, d_pos_c, d_pos_p, dt, N);
+    check(cudaGetLastError());
 }

@@ -10,15 +10,17 @@ static void check(cudaError_t e)
 
 ReacDiffSim::ReacDiffSim(int nx_, int ny_)
     : nx(nx_), ny(ny_),
-      d_u(nullptr), d_v(nullptr),
-      d_u_new(nullptr), d_v_new(nullptr),
+      d_u(nullptr), d_v(nullptr), d_Ta(nullptr),
+      d_u_new(nullptr), d_v_new(nullptr), d_Ta_new(nullptr),
       d_lap_u(nullptr)
 {
     size_t sz = size_t(nx) * ny * sizeof(float);
     check(cudaMalloc(&d_u, sz));
     check(cudaMalloc(&d_v, sz));
+    check(cudaMalloc(&d_Ta, sz));
     check(cudaMalloc(&d_u_new, sz));
     check(cudaMalloc(&d_v_new, sz));
+    check(cudaMalloc(&d_Ta_new, sz));
     check(cudaMalloc(&d_lap_u, sz));
 }
 
@@ -26,8 +28,10 @@ ReacDiffSim::~ReacDiffSim()
 {
     cudaFree(d_u);
     cudaFree(d_v);
+    cudaFree(d_Ta);
     cudaFree(d_u_new);
     cudaFree(d_v_new);
+    cudaFree(d_Ta_new);
     cudaFree(d_lap_u);
 }
 
@@ -58,7 +62,7 @@ __global__ void laplacianKernel(const float *__restrict__ u, float *__restrict__
 }
 
 // CUDA kernel for Aliev-Panfilov update
-__global__ void updateKernel(float *u, float *v, float *u_new, float *v_new, float *lap_u, float D, float dt, float eps_0, float a, float k, float mu1, float mu2, int nx, int ny)
+__global__ void updateKernel(float *u, float *v, float *Ta, float *u_new, float *v_new, float *Ta_new, float *lap_u, float D, float dt, float eps_0, float a, float k, float mu1, float mu2, float k_T, int nx, int ny)
 {
     int ix = blockIdx.x * blockDim.x + threadIdx.x;
     int iy = blockIdx.y * blockDim.y + threadIdx.y;
@@ -73,22 +77,26 @@ __global__ void updateKernel(float *u, float *v, float *u_new, float *v_new, flo
     float eps = eps_0 + ((mu1 * v_val) / (mu2 + u_val));
     u_new[idx] = u_val + ((-1 * k) * u_val * (u_val - a) * (u_val - 1) - (u_val * v_val)) * dt + D * lap_u[idx];
     v_new[idx] = v[idx] + eps * ((-1 * v_val) - (k * u_val * (u_val - a - 1))) * dt;
+    float eps_T = (u[idx] < 0.05) ? 10.0 : 1.0;
+    Ta_new[idx] = eps_T * (k_T * u[idx] - Ta[idx]) * dt + Ta[idx];
+
 }
 
 void ReacDiffSim::step(float D, float dt,
                        float eps0, float a, float k,
-                       float mu1, float mu2)
+                       float mu1, float mu2, float k_T)
 {
     dim3 block(32, 8);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
     laplacianKernel<<<grid, block>>>(d_u, d_lap_u, nx, ny);
     updateKernel<<<grid, block>>>(
-        d_u, d_v, d_u_new, d_v_new,
-        d_lap_u, D, dt, eps0, a, k, mu1, mu2,
+        d_u, d_v, d_Ta, d_u_new, d_v_new, d_Ta_new,
+        d_lap_u, D, dt, eps0, a, k, mu1, mu2, k_T,
         nx, ny);
     check(cudaDeviceSynchronize());
 
     std::swap(d_u, d_u_new);
     std::swap(d_v, d_v_new);
+    std::swap(d_Ta, d_Ta_new);
 }

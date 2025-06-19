@@ -8,6 +8,43 @@ from tqdm import tqdm
 import matplotlib
 matplotlib.use("Agg")
 
+# ------------------------------------------------------------------
+# Helper: build mesh segments from an (ny,nx,2) array **after sampling**
+# ------------------------------------------------------------------
+def make_sampled_mesh(coords: np.ndarray,
+                      nsamp: int = 20) -> list:
+    """
+    coords : full (ny,nx,2) array of vertex positions
+    nsamp  : number of sample points per axis (≤ nx and ny)
+
+    Returns list of 2‑point segments for the sampled horizontal &
+    vertical edges (grid size  nsamp × nsamp).
+    """
+    ny, nx, _ = coords.shape
+
+    # choose nsamp indices along each axis (inclusive ends)
+    xs = np.linspace(0, nx - 1, nsamp, dtype=int)
+    ys = np.linspace(0, ny - 1, nsamp, dtype=int)
+
+    # slice down to (nsamp, nsamp, 2)
+    small = coords[np.ix_(ys, xs)]
+
+    segs = []
+    # horizontal edges
+    segs.extend(
+        [[small[r, c], small[r, c + 1]]
+         for r in range(nsamp)
+         for c in range(nsamp - 1)]
+    )
+    # vertical edges
+    segs.extend(
+        [[small[r, c], small[r + 1, c]]
+         for c in range(nsamp)
+         for r in range(nsamp - 1)]
+    )
+    return segs
+
+
 # -------------------------------------------------------------
 # Parameters
 # -------------------------------------------------------------
@@ -67,7 +104,7 @@ with imageio.get_writer("simulation_with_mesh.mp4", fps=10) as writer:
         pos = np.fromfile(xf, dtype=np.float32).reshape((ny, nx, 2))
 
         # --- build mesh segments (every vertex) ----------------------
-        mesh_lines = make_mesh_segments(pos)
+        mesh_lines = make_sampled_mesh(pos, nsamp=20)
 
         # --- plotting ------------------------------------------------
         fig, ax = plt.subplots(figsize=(6, 6))

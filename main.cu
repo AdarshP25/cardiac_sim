@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <toml.hpp>
+#include <cmath>
 
 static void check(cudaError_t e)
 {
@@ -26,8 +27,8 @@ void initial_excitation(float *h_u, float *h_v, int nx, int ny)
     // Example excitation pattern
     int cx = nx / 2;
     int cy = ny / 2;
-    for (int j = cy - 1; j < cy + 1; ++j) {
-       for (int i = cx - 1; i < cx + 1; ++i) {
+    for (int j = 0; j < cy - 1; ++j) {
+       for (int i = 0; i < cx - 1; ++i) {
            if (i >= 0 && i < nx && j >=0 && j < ny) {
                size_t idx = static_cast<size_t>(j) * nx + i;
                h_u[idx] = 1.5f;
@@ -56,12 +57,12 @@ int main()
     const float ks_boundary = toml::find<float>(params, "mechanics", "ks_boundary");
     const float fiber_angle = toml::find<float>(params, "mechanics", "fiber_angle"); // radians
     const float damping = toml::find<float>(params, "mechanics", "damping");
-    const float ks_radial = 100.0f; // Stiffness for diagonal springs
+    const float ks_radial = toml::find<float>(params, "mechanics", "ks_radial");
 
     const float T0 = 50.0f;       // Maximum active tension (tune this - start comparable to ks_axial?)
     const float beta = 20.0f;    // Steepness of activation (tune this)
     const float ua = 0.15f;      // Activation threshold for u (tune this)
-    const float active_force_scaling = 0.1f; // Scales tension to force (tune this)
+    const float c_f = toml::find<float>(params, "mechanics", "c_f");
 
     const int snapshot_interval = toml::find<int>(params, "simulation", "snapshot_interval"); // Interval for saving snapshots
 
@@ -93,23 +94,24 @@ int main()
     delete[] h_u;
     delete[] h_v;
 
-    float* fiber_angles = new float[N];
-    for (int j = 0; j < ny; ++j) {
-        for (int i = 0; i < nx; ++i) {
-            fiber_angles[j * nx + i] = fiber_angle;
+    float2* fiber_angles = new float2[N];
+    for (int j = 0; j < ny - 1; ++j) {
+        for (int i = 0; i < nx - 1; ++i) {
+            fiber_angles[j * nx + i].x = std::cos(fiber_angle);
+            fiber_angles[j * nx + i].y = std::sin(fiber_angle);
         }
     }
     MechSim mechSim(nx, ny, fiber_angles, damping);
 
     // Time iter
     int buf_idx = 0;
-    for (int t = 1; t <= nt; ++t)
+    for (int t = 0; t <= nt; ++t)
     {
         
         sim.step(D, dt, eps0, a, k, mu1, mu2, k_T);
 
         if (mechanics_on){
-            mechSim.step(dt, ks_edge, ks_radial, ks_boundary, sim.d_Ta);
+            mechSim.step(dt, ks_edge, ks_radial, ks_boundary, sim.d_Ta, c_f);
         }
         
         // Snapshot saving logic

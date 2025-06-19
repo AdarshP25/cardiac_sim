@@ -5,10 +5,10 @@
 
 class MechSim {
 public:
-    MechSim(int nx_, int ny_, float* fiber_angles_, float damping_);
+    MechSim(int nx_, int ny_, float2* fiber_angles_, float damping_);
     ~MechSim();
 
-    void step(float dt, float ks_edge, float ks_radial, float ks_boundary, float* T_a);
+    void step(float dt, float ks_edge, float ks_radial, float ks_boundary, float* T_a, float c_f);
 
     void download_positions(std::vector<float2>& h_pos);
 
@@ -21,7 +21,7 @@ public:
     int nx, ny;      // grid dimensions
     int N;           // total vertices = nx * ny
     int C;           // total cells    = (nx-1) * (ny-1)
-    float* fiber_angles; // [N] fiber angles for each vertex
+    float2* fiber_angles; // [N] fiber angles for each vertex
     float damping;   // damping factor
 
     // Device arrays
@@ -29,8 +29,12 @@ public:
     float2* d_pos_p;          // [N] previous positions
     float2* d_vel;          // [N] current velocities
     float2* d_force;        // [N] accumulated forces
-    float* d_fiber_angles; // [N] fiber angles for each vertex
+    float2* d_fiber_angles; // [C] fiber angles for each cell
+    float* d_orthogonal_rest_lengths; // [C] rest lengths for each cell
+    bool* d_active_spring_is_horizontal; // [C] true if the spring is vertical, false if horizontal
     
+
+
     int* d_boundaryIdx;
     float2* d_boundaryPositions;
     int numBoundary; // Number of boundary vertices

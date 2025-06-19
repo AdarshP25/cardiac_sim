@@ -11,13 +11,13 @@ matplotlib.use("Agg")
 # -------------------------------------------------------------
 # Parameters
 # -------------------------------------------------------------
-nx, ny            = 12, 12
+nx, ny            = 102, 102
 nt                = 10_000
 snapshot_interval = 100
 
-u_files = [f"data2/u_{t}.bin" for t in range(snapshot_interval,
+u_files = [f"data2/u_{t}.bin" for t in range(0,
                                              nt + 1, snapshot_interval)]
-x_files = [f"data2/x_{t}.bin" for t in range(snapshot_interval,
+x_files = [f"data2/x_{t}.bin" for t in range(0,
                                              nt + 1, snapshot_interval)]
 assert len(u_files) == len(x_files), "u_ and x_ file counts differ"
 

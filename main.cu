@@ -27,16 +27,25 @@ void initial_excitation(float *h_u, float *h_v, int nx, int ny)
     // Example excitation pattern
     int cx = nx / 2;
     int cy = ny / 2;
-    for (int j = 0; j < cy - 1; ++j) {
-       for (int i = 0; i < cx - 1; ++i) {
+    for (int j = 0; j < 40; ++j) {
+       for (int i = 40; i < 50; ++i) {
            if (i >= 0 && i < nx && j >=0 && j < ny) {
                size_t idx = static_cast<size_t>(j) * nx + i;
-               h_u[idx] = 1.5f;
-               h_v[idx] = 0.4f;
+               h_u[idx] = 2.5f;
+           }
+       }
+    }
+    for (int j = 0; j < 40; ++j) {
+       for (int i = 50; i < nx; ++i) {
+           if (i >= 0 && i < nx && j >=0 && j < ny) {
+               size_t idx = static_cast<size_t>(j) * nx + i;
+               h_v[idx] = 3.0f;
            }
        }
     }
 }
+
+
 
 int main()
 {
@@ -59,9 +68,6 @@ int main()
     const float damping = toml::find<float>(params, "mechanics", "damping");
     const float ks_radial = toml::find<float>(params, "mechanics", "ks_radial");
 
-    const float T0 = 50.0f;       // Maximum active tension (tune this - start comparable to ks_axial?)
-    const float beta = 20.0f;    // Steepness of activation (tune this)
-    const float ua = 0.15f;      // Activation threshold for u (tune this)
     const float c_f = toml::find<float>(params, "mechanics", "c_f");
 
     const int snapshot_interval = toml::find<int>(params, "simulation", "snapshot_interval"); // Interval for saving snapshots
@@ -94,14 +100,17 @@ int main()
     delete[] h_u;
     delete[] h_v;
 
-    float2* fiber_angles = new float2[N];
-    for (int j = 0; j < ny - 1; ++j) {
-        for (int i = 0; i < nx - 1; ++i) {
-            fiber_angles[j * nx + i].x = std::cos(fiber_angle);
-            fiber_angles[j * nx + i].y = std::sin(fiber_angle);
-        }
+    // ---- host: build fibre map for cells ----
+    size_t C = static_cast<size_t>(nx-1)*(ny-1);
+    std::vector<float2> h_fiber(C);
+    for (int j=0; j<ny-1; ++j)
+        for (int i=0; i<nx-1; ++i) {
+            size_t ci = j*(nx-1) + i;           // <- **same formula MechSim uses**
+            h_fiber[ci] = make_float2(cosf(fiber_angle),
+                                    sinf(fiber_angle));
     }
-    MechSim mechSim(nx, ny, fiber_angles, damping);
+    MechSim mechSim(nx, ny, h_fiber.data(), damping);
+
 
     // Time iter
     int buf_idx = 0;

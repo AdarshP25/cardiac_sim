@@ -14,137 +14,85 @@ static void check(cudaError_t e)
     }
 }
 
-MechSim::MechSim(int nx_, int ny_, float2 *fiber_angles_, float damping_)
+__host__ __device__ __forceinline__
+int vid(int x,int y,int nx){ return y*nx + x; }
+
+MechSim::MechSim(int nx_, int ny_, float2 *h_fiber_angles, float damping_)
     : nx(nx_), ny(ny_), damping(damping_)
 {
-    N = nx * ny;
-    fiber_angles = fiber_angles_;
-    C = (nx - 1) * (ny - 1);
-    if (N <= 0 || C < 0)
-    {
-        throw std::runtime_error("Invalid grid dimensions");
-    }
-    size_t szN = N * sizeof(float2);
-    size_t szC4i = C > 0 ? C * 4 * sizeof(int) : 0;
-    size_t szC = C > 0 ? C * sizeof(float) : 0;
-    size_t szC4f = C > 0 ? C * 4 * sizeof(float) : 0;
-    size_t szC4f2 = C > 0 ? C * 4 * sizeof(float2) : 0;
-    size_t szC4b = C > 0 ? C * 4 * sizeof(bool) : 0;
+    N = nx*ny;                   // vertices
+    C = (nx-1)*(ny-1);           // cells
+    if(N==0 || C<0) throw std::runtime_error("bad grid");
 
-    // Allocate device arrays
-    check(cudaMalloc(&d_pos_c, szN));
-    check(cudaMalloc(&d_pos_p, szN));
-    check(cudaMalloc(&d_vel, szN));
-    check(cudaMalloc(&d_force, szN));
-    if (C > 0)
-    {
-        check(cudaMalloc(&d_cell_vidx, szC4i));
-        check(cudaMalloc(&d_fiber_angles, szC4f2));
-        check(cudaMalloc(&d_orthogonal_rest_lengths, szC4f));
-        check(cudaMalloc(&d_active_spring_is_horizontal, szC4b));
-    }
-    else
-    {
-        d_cell_vidx = nullptr;
-        d_fiber_angles = nullptr;
-        d_orthogonal_rest_lengths = nullptr;
-        d_active_spring_is_horizontal = nullptr;
-    }
+    // ---- device buffers ---------------------------------------------
+    check(cudaMalloc(&d_pos_c , N*sizeof(float2)));
+    check(cudaMalloc(&d_pos_p , N*sizeof(float2)));
+    check(cudaMalloc(&d_vel   , N*sizeof(float2)));
+    check(cudaMalloc(&d_force , N*sizeof(float2)));
 
-    // Initialize positions on host
+    check(cudaMalloc(&d_cell_vidx , C*4*sizeof(int)));
+    check(cudaMalloc(&d_fiber_angles, C*sizeof(float2)));
+    check(cudaMalloc(&d_orthogonal_rest_lengths, C*sizeof(float)));
+    check(cudaMalloc(&d_active_spring_is_horizontal, C*sizeof(char)));
+
+    // ---- initial vertex positions in row‑major order ----------------
     std::vector<float2> h_pos(N);
-    for (int j = 0; j < ny; ++j)
-    {
-        for (int i = 0; i < nx; ++i)
+    for(int y=0;y<ny;++y)
+        for(int x=0;x<nx;++x)
+            h_pos[vid(x,y,nx)] = make_float2(x*rest_length_edge,
+                                             y*rest_length_edge);
+
+    check(cudaMemcpy(d_pos_c,h_pos.data(),N*sizeof(float2),cudaMemcpyHostToDevice));
+    check(cudaMemcpy(d_pos_p,h_pos.data(),N*sizeof(float2),cudaMemcpyHostToDevice));
+    check(cudaMemset (d_vel  ,0,N*sizeof(float2)));
+    check(cudaMemset (d_force,0,N*sizeof(float2)));
+
+    std::vector<int>    h_idx(C*4);
+    std::vector<char>   h_asph(C,0);
+    std::vector<float>  h_rest(C);
+
+    int ci=0;
+    for(int y=0;y<ny-1;++y)
+        for(int x=0;x<nx-1;++x,++ci)
         {
-            int idx = j * nx + i;
-            h_pos[idx] = make_float2(static_cast<float>(i) * rest_length_edge, static_cast<float>(j) * rest_length_edge);
+            int i0 = vid(x  ,y  ,nx);
+            int i1 = vid(x+1,y  ,nx);
+            int i2 = vid(x+1,y+1,nx);
+            int i3 = vid(x  ,y+1,nx);
+
+            h_idx[ci*4+0]=i0; h_idx[ci*4+1]=i1;
+            h_idx[ci*4+2]=i2; h_idx[ci*4+3]=i3;
+
+            float2 f = h_fiber_angles[ci];
+            float  phi = atan2f(f.y,f.x);          // [-π,π]
+
+            if(phi<=M_PI_4 || phi>=3*M_PI_4)  h_asph[ci]=1;   // horizontal?
+            if(phi>=M_PI_2) phi-=M_PI_2;                      // |angle|≤π/4
+
+            h_rest[ci] = fabsf( (rest_length_edge*0.5f)/cosf(phi) );
         }
-    }
-    //h_pos[0] = make_float2(1.0f, 0.5f);
-    // Copy initial positions to both current and previous device arrays
-    check(cudaMemcpy(d_pos_c, h_pos.data(), szN, cudaMemcpyHostToDevice));
-    check(cudaMemcpy(d_pos_p, h_pos.data(), szN, cudaMemcpyHostToDevice)); // Initialize prev pos too
-    check(cudaMemset(d_vel, 0, szN));                                      // Initialize velocities to zero
-    check(cudaMemset(d_force, 0, szN));                                    // Initialize forces to zero
 
-    // Build connectivity and rest lengths on host if there are cells
-    if (C > 0)
-    {
-        std::vector<int> h_idx(C * 4);
-        std::vector<float4> h_rest_lengths(C);
-        std::vector<char> h_active_spring_is_horizontal(C, 0);
-        std::vector<float> h_orthogonal_rest_lengths(C);
-        int ci = 0;
-        for (int i = 0; i < nx - 1; ++i)
-        {
-            for (int j = 0; j < ny - 1; ++j, ++ci)
-            {
-                int i0 = i * nx + j;
-                int i1 = i * nx + j + 1;
-                int i2 = (i + 1) * nx + j + 1;
-                int i3 = (i + 1) * nx + j;
+    check(cudaMemcpy(d_cell_vidx ,h_idx .data(),C*4*sizeof(int)  ,cudaMemcpyHostToDevice));
+    check(cudaMemcpy(d_fiber_angles,h_fiber_angles,C*sizeof(float2),cudaMemcpyHostToDevice));
+    check(cudaMemcpy(d_active_spring_is_horizontal,h_asph.data(),C*sizeof(char),cudaMemcpyHostToDevice));
+    check(cudaMemcpy(d_orthogonal_rest_lengths   ,h_rest.data(),C*sizeof(float) ,cudaMemcpyHostToDevice));
 
-                // Check bounds (optional safety)
-                // if (i0 >= N || i1 >= N || i2 >= N || i3 >= N) continue;
 
-                h_idx[ci * 4 + 0] = i0;
-                h_idx[ci * 4 + 1] = i1;
-                h_idx[ci * 4 + 2] = i2;
-                h_idx[ci * 4 + 3] = i3;
-
-                // Calculate rest lengths for each orthogonal spring
-                float2 p0 = h_pos[i0];
-                float2 p1 = h_pos[i1];
-                float2 p2 = h_pos[i2];
-                float2 p3 = h_pos[i3];
-
-                float2 barycenter = make_float2(
-                    (p0.x + p1.x + p2.x + p3.x) / 4.0f,
-                    (p0.y + p1.y + p2.y + p3.y) / 4.0f);
-
-                float fiber_angle = atan2(fiber_angles[ci].y, fiber_angles[ci].x);
-
-                if (fiber_angle <= M_PI / 4 || fiber_angle >= 3 * M_PI / 4)
-                {
-                    h_active_spring_is_horizontal[ci] = true;
-                }
-
-                if (fiber_angle >= M_PI / 2)
-                {
-                    fiber_angle -= M_PI / 2;
-                }
-
-                h_orthogonal_rest_lengths[ci] = fabs((rest_length_edge / 2) / (cos(fiber_angle)));
+    std::vector<int>    bIdx;
+    std::vector<float2> bPos;
+    for(int y=0;y<ny;++y)
+        for(int x=0;x<nx;++x)
+            if(x==0||x==nx-1||y==0||y==ny-1){
+                bIdx.push_back(vid(x,y,nx));
+                bPos.push_back(make_float2(x*rest_length_edge,
+                                           y*rest_length_edge));
             }
-        }
-        check(cudaMemcpy(d_cell_vidx, h_idx.data(), szC4i, cudaMemcpyHostToDevice));
-        check(cudaMemcpy(d_fiber_angles, fiber_angles, szC4f2, cudaMemcpyHostToDevice));
-        check(cudaMemcpy(d_active_spring_is_horizontal, h_active_spring_is_horizontal.data(), szC4b, cudaMemcpyHostToDevice));
-        check(cudaMemcpy(d_orthogonal_rest_lengths, h_orthogonal_rest_lengths.data(), szC4f, cudaMemcpyHostToDevice));
-    }
 
-    std::vector<int> boundaryIdx;
-    std::vector<float2> boundaryPositions;
-
-    for (int j = 0; j < ny; ++j)
-    {
-        for (int i = 0; i < nx; ++i)
-        {
-            if (i == 0 || i == nx - 1 || j == 0 || j == ny - 1)
-            {
-                int idx = j * nx + i;
-                boundaryIdx.push_back(idx);
-                boundaryPositions.push_back(make_float2(static_cast<float>(i) * rest_length_edge, static_cast<float>(j) * rest_length_edge));
-            }
-        }
-    }
-
-    numBoundary = boundaryIdx.size();
-    cudaMalloc(&d_boundaryIdx, numBoundary * sizeof(int));
-    cudaMalloc(&d_boundaryPositions, numBoundary * 2 * sizeof(float));
-    cudaMemcpy(d_boundaryIdx, boundaryIdx.data(), numBoundary * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_boundaryPositions, boundaryPositions.data(), numBoundary * 2 * sizeof(float), cudaMemcpyHostToDevice);
+    numBoundary = (int)bIdx.size();
+    check(cudaMalloc(&d_boundaryIdx      , numBoundary*sizeof(int)));
+    check(cudaMalloc(&d_boundaryPositions, numBoundary*sizeof(float2)));
+    check(cudaMemcpy(d_boundaryIdx      ,bIdx.data(),numBoundary*sizeof(int)   ,cudaMemcpyHostToDevice));
+    check(cudaMemcpy(d_boundaryPositions,bPos.data(),numBoundary*sizeof(float2),cudaMemcpyHostToDevice));
 }
 
 MechSim::~MechSim()
@@ -356,7 +304,8 @@ __global__ void calculate_orthogonal_forces(const float2 *__restrict__ pos,
     // pre‑compute once
     float2 dir_ortho = make_float2(-fiber_angle.y,  fiber_angle.x);
     float  rest_a = orthogonal_rest_lengths[ci];                       // passive
-    float  rest_b = rest_a / (1.0f + c_f * T_a[ci]);                   // active
+    float T_a_avg = T_a[vidx[0]] + T_a[vidx[1]] + T_a[vidx[2]] + T_a[vidx[3]];
+    float  rest_b = rest_a / (1.0f + c_f * T_a_avg);                   // active
 
     #pragma unroll
     for (int k = 0; k < 4; ++k)

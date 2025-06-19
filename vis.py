@@ -6,6 +6,8 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.collections import LineCollection
 from tqdm import tqdm
 import matplotlib
+import toml
+
 matplotlib.use("Agg")
 
 # ------------------------------------------------------------------
@@ -48,14 +50,18 @@ def make_sampled_mesh(coords: np.ndarray,
 # -------------------------------------------------------------
 # Parameters
 # -------------------------------------------------------------
-nx, ny            = 102, 102
-nt                = 10_000
-snapshot_interval = 100
+cfg               = toml.load("config.toml")
 
-u_files = [f"data2/u_{t}.bin" for t in range(0,
-                                             nt + 1, snapshot_interval)]
-x_files = [f"data2/x_{t}.bin" for t in range(0,
-                                             nt + 1, snapshot_interval)]
+nx                = cfg["simulation"]["nx"]
+ny                = cfg["simulation"]["ny"]
+nt                = cfg["simulation"]["nt"]
+snapshot_interval = cfg["simulation"]["snapshot_interval"]
+
+# -------------------------------------------------------------
+# 2.  Build the list of snapshot file names
+# -------------------------------------------------------------
+u_files = [f"data2/u_{t}.bin" for t in range(0, nt + 1, snapshot_interval)]
+x_files = [f"data2/x_{t}.bin" for t in range(0, nt + 1, snapshot_interval)]
 assert len(u_files) == len(x_files), "u_ and x_ file counts differ"
 
 # -------------------------------------------------------------

@@ -17,6 +17,24 @@ static void check(cudaError_t e)
         throw std::runtime_error(cudaGetErrorString(e));
 }
 
+void small_excitation(float *h_u, float *h_v, int nx, int ny)
+{
+    size_t N = static_cast<size_t>(nx) * ny;
+    std::memset(h_u, 0, N * sizeof(float));
+    std::memset(h_v, 0, N * sizeof(float));
+
+    // Example excitation pattern
+    int cx = nx / 2;
+    int cy = ny / 2;
+    for (int j = cy - 1; j < cy + 1; ++j) {
+       for (int i = cx - 1; i < cx + 1; ++i) {
+           if (i >= 0 && i < nx && j >=0 && j < ny) {
+               size_t idx = static_cast<size_t>(j) * nx + i;
+               h_u[idx] = 2.5f;
+           }
+       }
+    }
+}
 
 void initial_excitation(float *h_u, float *h_v, int nx, int ny)
 {
@@ -55,6 +73,7 @@ int main()
     const int nx = toml::find<int>(params, "simulation", "nx"), ny = toml::find<int>(params, "simulation", "ny"), nt = toml::find<int>(params, "simulation", "nt"); // Grid size, number of timesteps
     const float dt = toml::find<float>(params, "simulation", "dt");                    // Timestep size
     const bool mechanics_on = toml::find<bool>(params, "simulation", "mechanics_on"); // Whether to run mechanics simulation
+    const int mechanics_per_potential = toml::find<int>(params, "simulation", "mechanics_per_potential");
 
     // Reaction-Diffusion parameters
     const float eps0 =  toml::find<float>(params, "voltage", "eps0"), a =  toml::find<float>(params, "voltage", "a"), k =  toml::find<float>(params, "voltage", "k");
@@ -93,7 +112,7 @@ int main()
     float *h_u = new float[N];
     float *h_v = new float[N];
     float *h_Ta = new float[N];
-    initial_excitation(h_u, h_v, nx, ny);
+    small_excitation(h_u, h_v, nx, ny);
     
     check(cudaMemcpy(sim.d_u, h_u, bytes_rd, cudaMemcpyHostToDevice));
     check(cudaMemcpy(sim.d_v, h_v, bytes_rd, cudaMemcpyHostToDevice));
@@ -105,7 +124,7 @@ int main()
     std::vector<float2> h_fiber(C);
     for (int j=0; j<ny-1; ++j)
         for (int i=0; i<nx-1; ++i) {
-            size_t ci = j*(nx-1) + i;           // <- **same formula MechSim uses**
+            size_t ci = j*(nx-1) + i;
             h_fiber[ci] = make_float2(cosf(fiber_angle),
                                     sinf(fiber_angle));
     }
@@ -120,7 +139,10 @@ int main()
         sim.step(D, dt, eps0, a, k, mu1, mu2, k_T);
 
         if (mechanics_on){
-            mechSim.step(dt, ks_edge, ks_radial, ks_boundary, sim.d_Ta, c_f);
+            for (int t2 = 0; t2 < mechanics_per_potential; t2++) 
+            {
+                mechSim.step(dt / mechanics_per_potential, ks_edge, ks_radial, ks_boundary, sim.d_Ta, c_f);
+            }
         }
         
         // Snapshot saving logic

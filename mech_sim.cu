@@ -259,80 +259,79 @@ __device__ __forceinline__ bool edge_intersects(const float2 v0,
     return true;
 }
 
-__global__ void calculate_orthogonal_forces(const float2 *__restrict__ pos,
-                                            const float2 *__restrict__ fiber_angles,
-                                            const float *T_a,
-                                            const float *orthogonal_rest_lengths,
-                                            const int *cell_vidx,
-                                            const bool *active_spring_is_horizontal,
-                                            float2 *force, int C, float ks_radial, float c_f)
+// averages Ta over the four vertices *inside the kernel*  (no extra buffers)
+__global__ void calculate_orthogonal_forces(
+        const float2* __restrict__ pos,
+        const float2* __restrict__ fiber_angles,         // per cell (C)
+        const float*  __restrict__ Ta_vertex,            // per vertex (N)
+        const float*  __restrict__ rest_passive,         // per cell (C)
+        const int*    __restrict__ cell_vidx,            // 4 vtx / cell (C*4)
+        const bool*   __restrict__ active_is_horz,       // per cell (C)
+        float2*       __restrict__ force,                // per vertex (N)
+        int   C,
+        float ks_radial, float c_f)
 {
     int ci = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ci >= C)
-        return;
+    if (ci >= C) return;
 
-    // Get cell vertex indices
-    int i0 = cell_vidx[ci * 4 + 0];
-    int i1 = cell_vidx[ci * 4 + 1];
-    int i2 = cell_vidx[ci * 4 + 2];
-    int i3 = cell_vidx[ci * 4 + 3];
+    // -------- vertex indices & positions -----------------------------
+    const int i0 = cell_vidx[4*ci+0];
+    const int i1 = cell_vidx[4*ci+1];
+    const int i2 = cell_vidx[4*ci+2];
+    const int i3 = cell_vidx[4*ci+3];
 
-    // Get positions of the vertices
-    float2 v0 = pos[i0];
-    float2 v1 = pos[i1];
-    float2 v2 = pos[i2];
-    float2 v3 = pos[i3];
+    const float2 v0 = pos[i0], v1 = pos[i1],
+                 v2 = pos[i2], v3 = pos[i3];
 
-    // Barycenter
-    float2 barycenter = make_float2(
-        (v0.x + v1.x + v2.x + v3.x) / 4.0f,
-        (v0.y + v1.y + v2.y + v3.y) / 4.0f);
+    const float2 bary = make_float2( (v0.x+v1.x+v2.x+v3.x)*0.25f,
+                                     (v0.y+v1.y+v2.y+v3.y)*0.25f );
 
-    // Fiber angle
-    float2 fiber_angle = fiber_angles[ci];
+    // ---------- activation: simple 4‑vertex average ------------------
+    float Ta_avg = 0.25f * ( Ta_vertex[i0] + Ta_vertex[i1]
+                           + Ta_vertex[i2] + Ta_vertex[i3] );
 
-    // Check if the active spring is horizontal
-    bool is_horizontal = active_spring_is_horizontal[ci];
+    // ---------- spring rest lengths ---------------------------------
+    const float rest_a = rest_passive[ci];
+    const float rest_b = rest_a / (1.0f + c_f * Ta_avg);
 
-    // Calculate intersection point with edge
-    // vertices of the current quad      (counter‑clockwise)
-    const int   vidx[4] = { i0, i1, i2, i3 };
-    const float2  v[4]  = { v0, v1, v2, v3 };
+    // ---------- local shortcuts -------------------------------------
+    const float2 fdir = fiber_angles[ci];
+    const float2 odir = make_float2(-fdir.y, fdir.x);
 
-    float2 intersection;
+    const int    vIdx[4] = { i0,i1,i2,i3 };
+    const float2 vPos[4] = { v0,v1,v2,v3 };
 
-    // pre‑compute once
-    float2 dir_ortho = make_float2(-fiber_angle.y,  fiber_angle.x);
-    float  rest_a = orthogonal_rest_lengths[ci];                       // passive
-    float T_a_avg = T_a[vidx[0]] + T_a[vidx[1]] + T_a[vidx[2]] + T_a[vidx[3]];
-    float  rest_b = rest_a / (1.0f + c_f * T_a_avg);                   // active
-
-    #pragma unroll
+    // ---------- edge loop -------------------------------------------
+#pragma unroll
     for (int k = 0; k < 4; ++k)
     {
-        int a = k;
-        int b = (k + 1) % 4; // next vertex index
+        int a = k, b = (k+1)&3;
 
-        bool edge_is_horz   = ((k & 1) == 0);
-        bool edge_is_active = edge_is_horz ^ is_horizontal;
-        float2 dir          = edge_is_active ? fiber_angle : dir_ortho;
-        float  rest_len     = edge_is_active ? rest_b      : rest_a;
+        bool edge_horz  = !(k & 1);             // 0,2 horizontal; 1,3 vertical
+        bool spring_act = edge_horz ^ active_is_horz[ci];
 
-        if (!edge_intersects(v[a], v[b], barycenter, dir, intersection))
-            continue;
+        float2 dir     = spring_act ? fdir : odir;
+        float  restLen = spring_act ? rest_b : rest_a;
 
-        float2 d = make_float2(
-            intersection.x - barycenter.x,
-            intersection.y - barycenter.y);
-        float  len = sqrtf(d.x*d.x + d.y*d.y);
-        if (len == 0.0f) continue;
+        // shoot ray in both directions so every edge gets a spring
+        for (int s = 0; s < 2; ++s)
+        {
+            float2 ray = s ? make_float2(-dir.x,-dir.y) : dir;
+            float2 q;
+            if (!edge_intersects(vPos[a], vPos[b], bary, ray, q))
+                continue;
 
-        float mag = ks_radial * (len - rest_len) / len;
+            float2 d   = make_float2(q.x - bary.x, q.y - bary.y);
+            float  len = sqrtf(d.x*d.x + d.y*d.y);
+            if (len < 1e-7f) continue;
 
-        atomicAdd(&force[vidx[a]].x, d.x * mag);
-        atomicAdd(&force[vidx[a]].y, d.y * mag);
-        atomicAdd(&force[vidx[b]].x, d.x * mag);
-        atomicAdd(&force[vidx[b]].y, d.y * mag);
+            float mag = ks_radial * (len - restLen) / len;   // Hookean
+
+            atomicAdd(&force[vIdx[a]].x, -d.x * mag);
+            atomicAdd(&force[vIdx[a]].y, -d.y * mag);
+            atomicAdd(&force[vIdx[b]].x, -d.x * mag);
+            atomicAdd(&force[vIdx[b]].y, -d.y * mag);
+        }
     }
 }
 

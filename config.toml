@@ -1,23 +1,24 @@
 [simulation]
 #simulation grid size
-nx = 202
-ny = 202
+nx = 12
+ny = 12
 
 #time step size
 dt = 0.01
 
 #number of time steps
-nt = 100001
+nt = 10001
 
 #mechanics on?
 mechanics_on = true
+mechanics_per_potential = 20
 
 #snapshot interval
-snapshot_interval = 1000
+snapshot_interval = 100
 
 #Reaction Diffusion Model Configuration (Aliev-Panfilov model)
 [voltage]
-D = 0.01  # Diffusion constant
+D = 0.001  # Diffusion constant
 eps0 = 0.01
 a = 0.1035
 k = 8.0
@@ -27,9 +28,9 @@ k_T = 3.0  # Active stress constant
 
 #Mechanical Model Configuration
 [mechanics]
-ks_edge = 30.0  # Edge spring constant
-ks_radial = 0.5 # Radial spring constant
-ks_boundary = 30.0 # Boundary spring constant
+ks_edge = 10.0  # Edge spring constant
+ks_radial = 10.0 # Radial spring constant
+ks_boundary = 10.0 # Boundary spring constant
 rest_edge_length = 1.0  # Rest edge length
 fiber_angle = 0.0  # Fiber angle in radians
 damping = 3.0  # Damping coefficient

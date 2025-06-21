@@ -17,7 +17,7 @@ static void check(cudaError_t e)
 __host__ __device__ __forceinline__
 int vid(int x,int y,int nx){ return y*nx + x; }
 
-MechSim::MechSim(int nx_, int ny_, float2 *h_fiber_angles, float damping_)
+MechSim::MechSim(int nx_, int ny_, float *h_fiber_angles, float damping_)
     : nx(nx_), ny(ny_), damping(damping_)
 {
     N = nx*ny;                   // vertices
@@ -31,7 +31,7 @@ MechSim::MechSim(int nx_, int ny_, float2 *h_fiber_angles, float damping_)
     check(cudaMalloc(&d_force , N*sizeof(float2)));
 
     check(cudaMalloc(&d_cell_vidx , C*4*sizeof(int)));
-    check(cudaMalloc(&d_fiber_angles, C*sizeof(float2)));
+    check(cudaMalloc(&d_intersection_ratio, C*sizeof(float)));
     check(cudaMalloc(&d_orthogonal_rest_lengths, C*sizeof(float)));
     check(cudaMalloc(&d_active_spring_is_horizontal, C*sizeof(char)));
 
@@ -50,9 +50,11 @@ MechSim::MechSim(int nx_, int ny_, float2 *h_fiber_angles, float damping_)
     std::vector<int>    h_idx(C*4);
     std::vector<char>   h_asph(C,0);
     std::vector<float>  h_rest(C);
+    std::vector<float> h_intersection_ratio(C);
 
     int ci=0;
     for(int y=0;y<ny-1;++y)
+    {
         for(int x=0;x<nx-1;++x,++ci)
         {
             int i0 = vid(x  ,y  ,nx);
@@ -63,17 +65,25 @@ MechSim::MechSim(int nx_, int ny_, float2 *h_fiber_angles, float damping_)
             h_idx[ci*4+0]=i0; h_idx[ci*4+1]=i1;
             h_idx[ci*4+2]=i2; h_idx[ci*4+3]=i3;
 
-            float2 f = h_fiber_angles[ci];
-            float  phi = atan2f(f.y,f.x);          // [-π,π]
+            float phi = h_fiber_angles[ci];
+            float cos_phi = cos(phi);
+            float sin_phi = sin(phi);
 
-            if(phi<=M_PI_4 || phi>=3*M_PI_4)  h_asph[ci]=1;   // horizontal?
-            if(phi>=M_PI_2) phi-=M_PI_2;                      // |angle|≤π/4
+            h_rest[ci] = fabsf( (rest_length_edge*0.5f) / (cos_phi) );
 
-            h_rest[ci] = fabsf( (rest_length_edge*0.5f)/cosf(phi) );
+            if(phi <= M_PI_4) {
+                h_asph[ci] = 1;
+                h_intersection_ratio[ci] = (0.5 * rest_length_edge - h_rest[ci] * sin_phi) / rest_length_edge;
+            } else if (phi <= 3 * M_PI_4) {
+                h_intersection_ratio[ci] = (0.5 * rest_length_edge + h_rest[ci] * cos_phi) / rest_length_edge;
+            } else {
+                h_asph[ci] = 1;
+                h_intersection_ratio[ci] = (0.5 * rest_length_edge + h_rest[ci] * sin_phi) / rest_length_edge;
+            }
         }
-
+    }
     check(cudaMemcpy(d_cell_vidx ,h_idx .data(),C*4*sizeof(int)  ,cudaMemcpyHostToDevice));
-    check(cudaMemcpy(d_fiber_angles,h_fiber_angles,C*sizeof(float2),cudaMemcpyHostToDevice));
+    check(cudaMemcpy(d_intersection_ratio, h_intersection_ratio.data(),C*sizeof(float),cudaMemcpyHostToDevice));
     check(cudaMemcpy(d_active_spring_is_horizontal,h_asph.data(),C*sizeof(char),cudaMemcpyHostToDevice));
     check(cudaMemcpy(d_orthogonal_rest_lengths   ,h_rest.data(),C*sizeof(float) ,cudaMemcpyHostToDevice));
 
@@ -175,7 +185,7 @@ __global__ void calculate_structural_forces(
 
     const int nbh[4][2] = {{-1, 0}, {+1, 0}, {0, -1}, {0, +1}};
 
-#pragma unroll
+    #pragma unroll
     for (int k = 0; k < 4; ++k)
     {
         int jx = ix + nbh[k][0];
@@ -199,7 +209,7 @@ __global__ void calculate_structural_forces(
     atomicAdd(&force[idx].y, damping_force.y);
 }
 
-__global__ void calculate_boundry_forces(const float2 *__restrict__ pos,
+__global__ void calculate_boundary_forces(const float2 *__restrict__ pos,
                                          float2 *__restrict__ force,
                                          const int *__restrict__ boundaryIdx,
                                          const float2 *__restrict__ boundaryPositions, float ks_boundary,
@@ -221,48 +231,10 @@ __global__ void calculate_boundry_forces(const float2 *__restrict__ pos,
     }
 }
 
-// 2‑D perpendicular dot (scalar cross product)
-__device__ __forceinline__ float perp_dot(const float2 &a, const float2 &b)
-{
-    return a.x * b.y - a.y * b.x;
-}
-
-__device__ __forceinline__ bool edge_intersects(const float2 v0,
-                                                const float2 v1,
-                                                const float2 barycenter,
-                                                const float2 fiber_angle,
-                                                float2 &intersection)
-{
-    // Edge and ray directions
-    float2 de = make_float2(v1.x - v0.x, v1.y - v0.y); // edge vector
-    float2 df = fiber_angle;                           // ray vector (unit)
-
-    // Solve  (v0 + t·de = c + s·df)
-    float2 cv0 = make_float2(barycenter.x - v0.x,
-                             barycenter.y - v0.y);
-
-    float den = perp_dot(de, df); // det |de  -df|
-    if (fabsf(den) < 1e-12f)
-        return false; // parallel → no hit
-
-    float t = perp_dot(cv0, df) / den; // position on edge
-    if (t < 0.0f || t > 1.0f)
-        return false; // outside segment
-
-    float s = perp_dot(cv0, de) / den; // position on ray
-    if (s < 0.0f)
-        return false; // behind barycenter
-
-    // Intersection point q = v0 + t·de
-    intersection.x = v0.x + t * de.x;
-    intersection.y = v0.y + t * de.y;
-    return true;
-}
-
 // averages Ta over the four vertices *inside the kernel*  (no extra buffers)
 __global__ void calculate_orthogonal_forces(
         const float2* __restrict__ pos,
-        const float2* __restrict__ fiber_angles,         // per cell (C)
+        const float*  __restrict__ intersect_ratios,         // per cell (C)
         const float*  __restrict__ Ta_vertex,            // per vertex (N)
         const float*  __restrict__ rest_passive,         // per cell (C)
         const int*    __restrict__ cell_vidx,            // 4 vtx / cell (C*4)
@@ -295,43 +267,40 @@ __global__ void calculate_orthogonal_forces(
     const float rest_b = rest_a / (1.0f + c_f * Ta_avg);
 
     // ---------- local shortcuts -------------------------------------
-    const float2 fdir = fiber_angles[ci];
-    const float2 odir = make_float2(-fdir.y, fdir.x);
 
     const int    vIdx[4] = { i0,i1,i2,i3 };
     const float2 vPos[4] = { v0,v1,v2,v3 };
 
+    const float intersect_ratio = intersect_ratios[ci];
+
     // ---------- edge loop -------------------------------------------
-#pragma unroll
+    #pragma unroll
     for (int k = 0; k < 4; ++k)
     {
         int a = k, b = (k+1)&3;
 
+        float t = intersect_ratios[ci];               // 0…1
+        float2 edge = make_float2(vPos[b].x - vPos[a].x,
+                                vPos[b].y - vPos[a].y);
+        float2 q    = make_float2(vPos[a].x + t*edge.x,
+                                vPos[a].y + t*edge.y);
+
+        float2 d    = make_float2(q.x - bary.x, q.y - bary.y);
+        float  length  = hypotf(d.x, d.y);
+        if(length < 1e-7f) continue;
+        d.x /= length; d.y /= length;
+
         bool edge_horz  = !(k & 1);             // 0,2 horizontal; 1,3 vertical
         bool spring_act = edge_horz ^ active_is_horz[ci];
 
-        float2 dir     = spring_act ? fdir : odir;
         float  restLen = spring_act ? rest_b : rest_a;
 
-        // shoot ray in both directions so every edge gets a spring
-        for (int s = 0; s < 2; ++s)
-        {
-            float2 ray = s ? make_float2(-dir.x,-dir.y) : dir;
-            float2 q;
-            if (!edge_intersects(vPos[a], vPos[b], bary, ray, q))
-                continue;
+        float mag = ks_radial * (length - restLen);
 
-            float2 d   = make_float2(q.x - bary.x, q.y - bary.y);
-            float  len = sqrtf(d.x*d.x + d.y*d.y);
-            if (len < 1e-7f) continue;
-
-            float mag = ks_radial * (len - restLen) / len;   // Hookean
-
-            atomicAdd(&force[vIdx[a]].x, -d.x * mag);
-            atomicAdd(&force[vIdx[a]].y, -d.y * mag);
-            atomicAdd(&force[vIdx[b]].x, -d.x * mag);
-            atomicAdd(&force[vIdx[b]].y, -d.y * mag);
-        }
+        atomicAdd(&force[vIdx[a]].x, -d.x * mag);
+        atomicAdd(&force[vIdx[a]].y, -d.y * mag);
+        atomicAdd(&force[vIdx[b]].x, -d.x * mag);
+        atomicAdd(&force[vIdx[b]].y, -d.y * mag);
     }
 }
 
@@ -357,7 +326,7 @@ void MechSim::step(float dt, float ks_edge, float ks_radial, float ks_boundary, 
     {
         int numCells = C;
         dim3 gridDim((numCells + blockSize - 1) / blockSize);
-        calculate_orthogonal_forces<<<gridDim, blockSize>>>(d_pos_c, d_fiber_angles, T_a, d_orthogonal_rest_lengths, d_cell_vidx, d_active_spring_is_horizontal, d_force, numCells, ks_radial, c_f);
+        calculate_orthogonal_forces<<<gridDim, blockSize>>>(d_pos_c, d_intersection_ratio, T_a, d_orthogonal_rest_lengths, d_cell_vidx, d_active_spring_is_horizontal, d_force, numCells, ks_radial, c_f);
         check(cudaGetLastError());
     }
 
@@ -368,7 +337,7 @@ void MechSim::step(float dt, float ks_edge, float ks_radial, float ks_boundary, 
     check(cudaGetLastError());
 
     // Calculate boundary forces
-    calculate_boundry_forces<<<(numBoundary + blockSize - 1) / blockSize, blockSize>>>(d_pos_c, d_force, d_boundaryIdx, d_boundaryPositions, ks_boundary, numBoundary);
+    calculate_boundary_forces<<<(numBoundary + blockSize - 1) / blockSize, blockSize>>>(d_pos_c, d_force, d_boundaryIdx, d_boundaryPositions, ks_boundary, numBoundary);
     check(cudaGetLastError());
 
     // Position Verlet integration

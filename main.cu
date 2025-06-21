@@ -121,12 +121,11 @@ int main()
 
     // ---- host: build fibre map for cells ----
     size_t C = static_cast<size_t>(nx-1)*(ny-1);
-    std::vector<float2> h_fiber(C);
+    std::vector<float> h_fiber(C);
     for (int j=0; j<ny-1; ++j)
         for (int i=0; i<nx-1; ++i) {
             size_t ci = j*(nx-1) + i;
-            h_fiber[ci] = make_float2(cosf(fiber_angle),
-                                    sinf(fiber_angle));
+            h_fiber[ci] = fiber_angle;
     }
     MechSim mechSim(nx, ny, h_fiber.data(), damping);
 

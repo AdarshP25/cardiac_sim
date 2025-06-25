@@ -17,6 +17,25 @@ static void check(cudaError_t e)
         throw std::runtime_error(cudaGetErrorString(e));
 }
 
+void dot_excitation(float *h_u, float *h_v, int nx, int ny)
+{
+    size_t N = static_cast<size_t>(nx) * ny;
+    std::memset(h_u, 0, N * sizeof(float));
+    std::memset(h_v, 0, N * sizeof(float));
+
+    // Example excitation pattern
+    int cx = nx / 2;
+    int cy = ny / 2;
+    for (int j = cy; j < cy + 1; ++j) {
+       for (int i = cx; i < cx + 1; ++i) {
+           if (i >= 0 && i < nx && j >=0 && j < ny) {
+               size_t idx = static_cast<size_t>(j) * nx + i;
+               h_u[idx] = 2.5f;
+           }
+       }
+    }
+}
+
 void small_excitation(float *h_u, float *h_v, int nx, int ny)
 {
     size_t N = static_cast<size_t>(nx) * ny;
@@ -63,7 +82,13 @@ void initial_excitation(float *h_u, float *h_v, int nx, int ny)
     }
 }
 
-
+__global__ void pack_force_x(const float2* __restrict__ d_force,
+                             float*       __restrict__ d_fx,
+                             int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) d_fx[i] = d_force[i].x;
+}
 
 int main()
 {
@@ -112,7 +137,7 @@ int main()
     float *h_u = new float[N];
     float *h_v = new float[N];
     float *h_Ta = new float[N];
-    small_excitation(h_u, h_v, nx, ny);
+    dot_excitation(h_u, h_v, nx, ny);
     
     check(cudaMemcpy(sim.d_u, h_u, bytes_rd, cudaMemcpyHostToDevice));
     check(cudaMemcpy(sim.d_v, h_v, bytes_rd, cudaMemcpyHostToDevice));
@@ -129,7 +154,9 @@ int main()
     }
     MechSim mechSim(nx, ny, h_fiber.data(), damping);
 
-
+    float* d_fx = nullptr;
+    check(cudaMalloc(&d_fx, N * sizeof(float)));
+    
     // Time iter
     int buf_idx = 0;
     for (int t = 0; t <= nt; ++t)
@@ -149,12 +176,19 @@ int main()
         {
             buf_idx = 1 - buf_idx; // Toggle buffer index
 
-            check(cudaMemcpyAsync(
-                h_frame_rd[buf_idx],
-                sim.d_u, // Source: device u field
-                bytes_rd,
-                cudaMemcpyDeviceToHost,
-                ioStream));
+            // ---- pack d_force.x → d_fx -----------------------------------
+            int block = 256;
+            int grid  = (N + block - 1) / block;
+            pack_force_x<<<grid, block, 0, ioStream>>>(mechSim.d_force, d_fx, (int)N);
+            check(cudaGetLastError());
+
+            // ---- async copy to host --------------------------------------
+            check(cudaMemcpyAsync(h_frame_rd[buf_idx],   // ← reuse old buffer
+                                d_fx,
+                                bytes_rd,              // N * sizeof(float)
+                                cudaMemcpyDeviceToHost,
+                                ioStream));
+
 
             check(cudaMemcpyAsync(
                 h_frame_mech[buf_idx],
@@ -169,7 +203,7 @@ int main()
                     check(cudaStreamSynchronize(ioStream)); // Wait for copies on ioStream to finish
 
                     
-                    std::string filename_u = "data2/u_" + std::to_string(t) + ".bin";
+                    std::string filename_u = "data4/u_" + std::to_string(t) + ".bin";
                     std::ofstream outU(filename_u, std::ios::binary);
                     if(outU) {
                         outU.write(reinterpret_cast<char*>(h_frame_rd[buf_idx]), bytes_rd);
@@ -177,7 +211,7 @@ int main()
                          std::cerr << "Error opening file: " << filename_u << std::endl;
                     }
 
-                    std::string filename_x = "data2/x_" + std::to_string(t) + ".bin";
+                    std::string filename_x = "data4/x_" + std::to_string(t) + ".bin";
                     std::ofstream outX(filename_x, std::ios::binary);
                      if(outX) {
                         outX.write(reinterpret_cast<char*>(h_frame_mech[buf_idx]), bytes_mech);

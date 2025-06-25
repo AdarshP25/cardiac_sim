@@ -41,6 +41,8 @@ MechSim::MechSim(int nx_, int ny_, float *h_fiber_angles, float damping_)
         for(int x=0;x<nx;++x)
             h_pos[vid(x,y,nx)] = make_float2(x*rest_length_edge,
                                              y*rest_length_edge);
+    h_pos[vid(0,2,nx)].x += 0.1f;
+    h_pos[vid(2,1,nx)].x += 0.0f;
 
     check(cudaMemcpy(d_pos_c,h_pos.data(),N*sizeof(float2),cudaMemcpyHostToDevice));
     check(cudaMemcpy(d_pos_p,h_pos.data(),N*sizeof(float2),cudaMemcpyHostToDevice));
@@ -66,19 +68,19 @@ MechSim::MechSim(int nx_, int ny_, float *h_fiber_angles, float damping_)
             h_idx[ci*4+2]=i2; h_idx[ci*4+3]=i3;
 
             float phi = h_fiber_angles[ci];
-            float cos_phi = cos(phi);
-            float sin_phi = sin(phi);
+            float cos_phi = cosf(phi);
+            float sin_phi = sinf(phi);
 
             h_rest[ci] = fabsf( (rest_length_edge*0.5f) / (cos_phi) );
 
             if(phi <= M_PI_4) {
                 h_asph[ci] = 1;
-                h_intersection_ratio[ci] = (0.5 * rest_length_edge - h_rest[ci] * sin_phi) / rest_length_edge;
+                h_intersection_ratio[ci] = (0.5f * rest_length_edge - h_rest[ci] * sin_phi) / rest_length_edge;
             } else if (phi <= 3 * M_PI_4) {
-                h_intersection_ratio[ci] = (0.5 * rest_length_edge + h_rest[ci] * cos_phi) / rest_length_edge;
+                h_intersection_ratio[ci] = (0.5f * rest_length_edge + h_rest[ci] * cos_phi) / rest_length_edge;
             } else {
                 h_asph[ci] = 1;
-                h_intersection_ratio[ci] = (0.5 * rest_length_edge + h_rest[ci] * sin_phi) / rest_length_edge;
+                h_intersection_ratio[ci] = (0.5f * rest_length_edge + h_rest[ci] * sin_phi) / rest_length_edge;
             }
         }
     }
@@ -131,13 +133,15 @@ __global__ void position_verlet(
     {
         float2 current_pos = pos[i];
 
+        float2 previous_pos = prev_pos[i];
+
         float2 accel = force[i];
 
         float2 next_pos;
         float dt_sq = dt * dt;
 
-        next_pos.x = 2.0f * current_pos.x - prev_pos[i].x + accel.x * dt_sq;
-        next_pos.y = 2.0f * current_pos.y - prev_pos[i].y + accel.y * dt_sq;
+        next_pos.x = 2.0f * current_pos.x - previous_pos.x + accel.x * dt_sq;
+        next_pos.y = 2.0f * current_pos.y - previous_pos.y + accel.y * dt_sq;
 
         prev_pos[i] = current_pos;
 
@@ -304,6 +308,61 @@ __global__ void calculate_orthogonal_forces(
     }
 }
 
+//--------------------------------------------------------------------
+// Do a single Position‑Verlet step on the CPU.
+//
+//  d_pos_c   : device pointer to current positions   (xₙ)
+//  d_pos_p   : device pointer to previous positions  (xₙ₋₁)
+//  d_force   : device pointer to forces at time n    (fₙ = m aₙ)
+//
+//  N         : number of vertices
+//  dt        : timestep (s)
+//
+// After the call       d_pos_c and d_pos_p are updated on the GPU.
+//--------------------------------------------------------------------
+void cpuVerletHostStep(float2 *d_pos_c,
+                       float2 *d_pos_p,
+                       const float2 *d_force,
+                       int N,
+                       float dt)
+{
+    if (dt <= 0.0f || N == 0) throw std::runtime_error("bad arguments");
+
+    // 1.  Bring the three arrays to the host
+    std::vector<float2> h_pos_c(N), h_pos_p(N), h_force(N);
+
+    check(cudaMemcpy(h_pos_c.data(), d_pos_c, N*sizeof(float2),
+                     cudaMemcpyDeviceToHost));
+    check(cudaMemcpy(h_pos_p.data(), d_pos_p, N*sizeof(float2),
+                     cudaMemcpyDeviceToHost));
+    check(cudaMemcpy(h_force.data(), d_force, N*sizeof(float2),
+                     cudaMemcpyDeviceToHost));
+
+    // 2.  Integrate on the CPU
+    const float dt2 = dt*dt;
+    //#pragma omp parallel for       // optional: use OpenMP if available
+    for (int i = 0; i < N; ++i)
+    {
+        float2 xn   = h_pos_c[i];
+        float2 xn_1 = h_pos_p[i];
+        float2 a    = h_force[i];          // mass = 1 → a = f
+
+        float2 xn1;                        // x_{n+1}
+        xn1.x = 2.0f*xn.x - xn_1.x + a.x*dt2;
+        xn1.y = 2.0f*xn.y - xn_1.y + a.y*dt2;
+
+        h_pos_p[i] = xn;                   // store old xₙ   → xₙ₋₁
+        h_pos_c[i] = xn1;                  // store new xₙ₊₁ → xₙ
+    }
+
+    // 3.  Copy positions back to the device
+    check(cudaMemcpy(d_pos_c, h_pos_c.data(), N*sizeof(float2),
+                     cudaMemcpyHostToDevice));
+    check(cudaMemcpy(d_pos_p, h_pos_p.data(), N*sizeof(float2),
+                     cudaMemcpyHostToDevice));
+}
+
+
 void MechSim::step(float dt, float ks_edge, float ks_radial, float ks_boundary, float *T_a, float c_f)
 {
     if (dt <= 0.0f)
@@ -317,9 +376,6 @@ void MechSim::step(float dt, float ks_edge, float ks_radial, float ks_boundary, 
     clear_forces<<<numBlocks, blockSize>>>(d_force, N);
     check(cudaGetLastError());
 
-    // Calculate velocities
-    calculate_velocity_pv<<<(N + blockSize - 1) / blockSize, blockSize>>>(d_vel, d_pos_c, d_pos_p, dt, N);
-    check(cudaGetLastError());
 
     // Calculate orthogonal forces
     if (C > 0)
@@ -341,7 +397,12 @@ void MechSim::step(float dt, float ks_edge, float ks_radial, float ks_boundary, 
     check(cudaGetLastError());
 
     // Position Verlet integration
-    position_verlet<<<(N + blockSize - 1) / blockSize, blockSize>>>(d_pos_c, d_pos_p, d_force, dt, N);
+    //position_verlet<<<(N + blockSize - 1) / blockSize, blockSize>>>(d_pos_c, d_pos_p, d_force, dt, N);
+    cpuVerletHostStep(d_pos_c, d_pos_p, d_force, N, dt);
+    //check(cudaGetLastError());
+
+    // Calculate velocities
+    calculate_velocity_pv<<<(N + blockSize - 1) / blockSize, blockSize>>>(d_vel, d_pos_c, d_pos_p, dt, N);
     check(cudaGetLastError());
 
 }

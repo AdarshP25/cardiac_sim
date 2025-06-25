@@ -1,17 +1,17 @@
 [simulation]
 #simulation grid size
-nx = 12
-ny = 12
+nx = 3
+ny = 3
 
 #time step size
-dt = 0.01
+dt = 0.001
 
 #number of time steps
-nt = 10001
+nt = 10000
 
 #mechanics on?
 mechanics_on = true
-mechanics_per_potential = 20
+mechanics_per_potential = 10
 
 #snapshot interval
 snapshot_interval = 100
@@ -29,9 +29,9 @@ k_T = 3.0  # Active stress constant
 #Mechanical Model Configuration
 [mechanics]
 ks_edge = 10.0  # Edge spring constant
-ks_radial = 10.0 # Radial spring constant
-ks_boundary = 10.0 # Boundary spring constant
+ks_radial = 0.0 # Radial spring constant
+ks_boundary = 0.0 # Boundary spring constant
 rest_edge_length = 1.0  # Rest edge length
 fiber_angle = 0.0  # Fiber angle in radians
-damping = 3.0  # Damping coefficient
+damping = 0.0  # Damping coefficient
 c_f = 0.1 # Fiber constant

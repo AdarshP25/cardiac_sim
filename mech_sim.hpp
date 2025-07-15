@@ -5,10 +5,10 @@
 
 class MechSim {
 public:
-    MechSim(int nx_, int ny_, float* fiber_angles_, float damping_);
+    MechSim(int nx_, int ny_, float* fiber_angles_, float damping_, int padding);
     ~MechSim();
 
-    void step(float dt, float ks_edge, float ks_radial, float ks_boundary, float* T_a, float c_f);
+    void step(float dt, float ks_edge, float ks_radial, float ks_boundary, float* T_a, float c_f, float fmax);
 
     void download_positions(std::vector<float2>& h_pos);
 
@@ -23,8 +23,10 @@ public:
     int C;           // total cells    = (nx-1) * (ny-1)
     float* fiber_angles; // [N] fiber angles for each vertex
     float damping;   // damping factor
+    int padding;    // mech padding
 
     // Device arrays
+    float2* d_global_pos;     // [N] global positions
     float2* d_pos_c;          // [N] current positions
     float2* d_pos_p;          // [N] previous positions
     float2* d_vel;          // [N] current velocities

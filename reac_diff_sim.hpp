@@ -1,5 +1,6 @@
 #pragma once
 #include <cuda_runtime.h>
+#include <random>
 
 struct ReacDiffSim
 {
@@ -9,4 +10,5 @@ struct ReacDiffSim
     ReacDiffSim(int nx, int ny);
     ~ReacDiffSim();
     void step(float D, float dt, float eps0, float a, float k, float mu1, float mu2, float k_T);
+    void randomFocal(float prob, std::mt19937 &rng);
 };

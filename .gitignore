@@ -3,3 +3,4 @@ data/
 *.out
 *.mp4
 *.nsys-rep
+config/

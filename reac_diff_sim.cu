@@ -1,5 +1,6 @@
 #include "reac_diff_sim.hpp"
 #include <stdexcept>
+#include <random>
 
 // helper
 static void check(cudaError_t e)
@@ -99,4 +100,43 @@ void ReacDiffSim::step(float D, float dt,
     std::swap(d_u, d_u_new);
     std::swap(d_v, d_v_new);
     std::swap(d_Ta, d_Ta_new);
+}
+
+
+// ── GPU kernel: add `inc` inside a disc of radius r, centred at (cx,cy)
+__global__
+void add_disc(float *u, int nx, int ny,
+              int cx, int cy, int r, float inc)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int N   = nx * ny;
+    if (idx >= N) return;
+
+    int  x  = idx % nx;
+    int  y  = idx / nx;
+    int dx  = x - cx;
+    int dy  = y - cy;
+
+    if (dx*dx + dy*dy <= r*r)
+        u[idx] += inc;
+}
+
+void ReacDiffSim::randomFocal(float prob, std::mt19937 &rng)
+{
+    static std::uniform_real_distribution<float> unif01(0.0f, 1.0f);
+    if (unif01(rng) >= prob) return;
+
+    /* pick a safe centre  */
+    int  r  = int(0.05f * std::min(nx, ny));
+    if (r < 1) r = 1;                         // guard tiny grids
+    int  cx = r + rand() % (nx - 2*r);
+    int  cy = r + rand() % (ny - 2*r);
+
+    // one 1‑D launch is enough for disc radii ≪ grid size
+    int N = nx * ny;
+    int block = 256;
+    int grid  = (N + block - 1) / block;
+
+    add_disc<<<grid, block>>>(d_u, nx, ny, cx, cy, r, 1.0f);
+    check(cudaGetLastError());   // macro from your helper
 }
